@@ -134,7 +134,7 @@ async def create_payment_link(user_id: str, service: str, tariff: str, amount: f
 async def track_event(user_id: str, event: str):
     async with aiohttp.ClientSession() as session:
         await session.get(
-            f"https://mc.yandex.ru/metrika/tag.js?counter={YANDEX_METRIKA_ID}&event={event}&user_id={user_id}"
+            f"https://mc.yandex.ru/metrika/tag.js?counter={YANDEX_METRIKA_ID}&event={event}&users_id={user_id}"
         )
 
 # Стартовое сообщение
