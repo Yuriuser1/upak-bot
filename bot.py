@@ -35,11 +35,17 @@ YANDEX_CHECKOUT_SHOP_ID = os.getenv("YANDEX_CHECKOUT_SHOP_ID")
 YANDEX_METRIKA_ID = os.getenv("YANDEX_METRIKA_ID")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-if not all([TELEGRAM_TOKEN, YANDEX_GPT_API_KEY, BITRIX24_WEBHOOK, YANDEX_CHECKOUT_KEY, YANDEX_CHECKOUT_SHOP_ID]):
-    raise ValueError("Не установлены необходимые переменные окружения")
+# Проверка критически важных переменных
+if not all([TELEGRAM_TOKEN, YANDEX_GPT_API_KEY]):
+    raise ValueError("Не установлены критически важные переменные окружения: TELEGRAM_TOKEN, YANDEX_GPT_API_KEY")
 
-# Подключение к Redis для управления сессиями
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+# Подключение к Redis (с fallback, если REDIS_URL не настроен)
+try:
+    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+except redis.RedisError as e:
+    logger.warning(f"Не удалось подключиться к Redis: {e}. Используется локальная память.")
+    redis_client = None
 
 # Модель данных для карточки товара
 class ProductCard(BaseModel):
@@ -84,13 +90,16 @@ async def generate_card_data(product_text: str, user_id: str) -> ProductCard:
 
 # Интеграция с Bitrix24 для добавления лида
 async def add_lead_to_bitrix24(user_id: str, username: str, service: str):
+    if not BITRIX24_WEBHOOK:
+        logger.warning("Bitrix24 webhook не настроен, пропускаем добавление лида")
+        return
     payload = {
         "fields": {
             "TITLE": f"Лид от Telegram: {username}",
             "SOURCE_ID": "TELEGRAM",
             "ASSIGNED_BY_ID": 1,
             "COMMENTS": f"Заинтересован в услуге: {service}",
-            "UF_CRM_1634567890": user_id  # Пользовательское поле для Telegram ID
+            "UF_CRM_1634567890": user_id
         }
     }
     try:
@@ -105,6 +114,9 @@ async def add_lead_to_bitrix24(user_id: str, username: str, service: str):
 
 # Создание платежной ссылки через Yandex.Checkout
 async def create_payment_link(user_id: str, service: str, tariff: str, amount: float) -> str:
+    if not (YANDEX_CHECKOUT_KEY and YANDEX_CHECKOUT_SHOP_ID):
+        logger.warning("Yandex.Checkout не настроен, возвращаем заглушку")
+        return "https://upak.space/payment-not-configured"
     payment_id = str(uuid.uuid4())
     payload = {
         "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
@@ -132,10 +144,16 @@ async def create_payment_link(user_id: str, service: str, tariff: str, amount: f
 
 # Отправка события в Yandex Metrika
 async def track_event(user_id: str, event: str):
+    if not YANDEX_METRIKA_ID:
+        logger.warning("Yandex Metrika не настроена, пропускаем трекинг")
+        return
     async with aiohttp.ClientSession() as session:
-        await session.get(
-            f"https://mc.yandex.ru/metrika/tag.js?counter={YANDEX_METRIKA_ID}&event={event}&users_id={user_id}"
-        )
+        try:
+            await session.get(
+                f"https://mc.yandex.ru/metrika/tag.js?counter={YANDEX_METRIKA_ID}&event={event}&user_id={user_id}"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка Yandex Metrika: {e}")
 
 # Стартовое сообщение
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -246,7 +264,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(f"Вы выбрали тариф *{tariff.capitalize()}* для услуги *{service}*. Стоимость: {amount:,} ₽/мес.\nПерейдите для оплаты:", reply_markup=reply_markup, parse_mode='Markdown')
     elif query.data == 'demo':
-        redis_client.setex(f"demo_{user_id}", 3600, json.dumps({"status": "active", "timestamp": datetime.utcnow().isoformat()}))
+        if redis_client:
+            redis_client.setex(f"demo_{user_id}", 3600, json.dumps({"status": "active", "timestamp": datetime.utcnow().isoformat()}))
+        else:
+            logger.warning("Redis недоступен, демо-режим не сохранен")
         await query.edit_message_text("Запустите демо, отправив описание товара или выбрав услугу.")
 
 # Обработка текстовых сообщений
@@ -256,7 +277,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     await track_event(user_id, "text_input")
 
-    demo_status = redis_client.get(f"demo_{user_id}")
+    demo_status = redis_client.get(f"demo_{user_id}") if redis_client else None
     if demo_status and json.loads(demo_status).get("status") == "active":
         await update.message.reply_text("🧠 Генерируем демо-карточку... Пожалуйста, подождите 10–15 секунд.")
         card = await generate_card_data(user_text, user_id)
