@@ -1,0 +1,43 @@
+
+version: '3.8'
+
+services:
+  upak-bot:
+    build: .
+    container_name: upak-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - upak-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: upak-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - upak-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  redis_data:
+
+networks:
+  upak-network:
+    driver: bridge
