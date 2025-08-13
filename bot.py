@@ -112,35 +112,68 @@ async def add_lead_to_bitrix24(user_id: str, username: str, service: str):
     except Exception as e:
         logger.error(f"Ошибка интеграции с Bitrix24: {e}")
 
-# Создание платежной ссылки через Yandex.Checkout
+# Создание платежной ссылки через YooKassa (ЮKassa)
 async def create_payment_link(user_id: str, service: str, tariff: str, amount: float) -> str:
     if not (YANDEX_CHECKOUT_KEY and YANDEX_CHECKOUT_SHOP_ID):
-        logger.warning("Yandex.Checkout не настроен, возвращаем заглушку")
+        logger.warning("YooKassa не настроена, возвращаем заглушку")
         return "https://upak.space/payment-not-configured"
+    
+    import base64
     payment_id = str(uuid.uuid4())
+    
+    # Правильная авторизация для YooKassa API - Basic Auth
+    auth_string = base64.b64encode(f"{YANDEX_CHECKOUT_SHOP_ID}:{YANDEX_CHECKOUT_KEY}".encode()).decode()
+    
     payload = {
         "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
         "confirmation": {"type": "redirect", "return_url": "https://upak.space/payment-success"},
         "capture": True,
         "description": f"Оплата тарифа {tariff} для {service} (ID: {user_id})",
-        "metadata": {"user_id": user_id, "service": service, "tariff": tariff}
+        "metadata": {"user_id": user_id, "service": service, "tariff": tariff},
+        "receipt": {
+            "customer": {
+                "email": f"user_{user_id}@upak.space"
+            },
+            "items": [
+                {
+                    "description": f"Тариф {tariff.upper()} платформы UPAK",
+                    "quantity": "1.00",
+                    "amount": {
+                        "value": f"{amount:.2f}",
+                        "currency": "RUB"
+                    },
+                    "vat_code": "1",
+                    "payment_mode": "full_payment",
+                    "payment_subject": "service"
+                }
+            ]
+        }
     }
+    
     headers = {
-        "Idempotency-Key": payment_id,
-        "Authorization": f"Bearer {YANDEX_CHECKOUT_KEY}"
+        "Idempotence-Key": payment_id,
+        "Authorization": f"Basic {auth_string}",
+        "Content-Type": "application/json"
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"https://api.yookassa.ru/v3/payments",
-            json=payload,
-            headers=headers
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data["confirmation"]["confirmation_url"]
-            else:
-                logger.error(f"Ошибка Yandex.Checkout: {response.status}")
-                return "https://upak.space/payment-error"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.yookassa.ru/v3/payments",
+                json=payload,
+                headers=headers
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info(f"Платеж создан успешно: {data.get('id')}")
+                    return data["confirmation"]["confirmation_url"]
+                else:
+                    response_text = await response.text()
+                    logger.error(f"Ошибка YooKassa: {response.status}, Response: {response_text}")
+                    return "https://upak.space/payment-error"
+    except Exception as e:
+        logger.error(f"Исключение при создании платежа: {e}")
+        return "https://upak.space/payment-error"
 
 # Отправка события в Yandex Metrika
 async def track_event(user_id: str, event: str):
@@ -164,25 +197,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [
-            InlineKeyboardButton("📦 Упаковка карточек", callback_data='order_packaging'),
-            InlineKeyboardButton("🤖 ИИ-ассистенты", callback_data='ai_assistants')
+            InlineKeyboardButton("🆓 Попробовать бесплатно", callback_data='free_demo'),
+            InlineKeyboardButton("💎 Выбрать тариф", callback_data='choose_plan')
         ],
         [
-            InlineKeyboardButton("📝 Контент-маркетинг", callback_data='content_automation'),
-            InlineKeyboardButton("📊 Аналитика", callback_data='predictive_analytics')
-        ],
-        [
-            InlineKeyboardButton("💬 Чат-боты", callback_data='chatbots'),
-            InlineKeyboardButton("ℹ️ О UPAK", callback_data='about')
+            InlineKeyboardButton("ℹ️ О UPAK", callback_data='about'),
+            InlineKeyboardButton("💡 Как это работает", callback_data='how_it_works')
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     welcome_text = (
-        "Добро пожаловать в UPAK! 🚀\n"
-        "Мы автоматизируем продвижение на Wildberries и Ozon с помощью ИИ.\n"
-        "Выберите услугу ниже или отправьте описание товара для создания карточки."
+        "Добро пожаловать в UPAK! 🚀\n\n"
+        "🎯 *Создавай, Автоматизируй, Проверяй*\n\n"
+        "Платформа для создания продающих карточек на Wildberries и Ozon:\n"
+        "• 🎨 Конструктор карточек с ИИ\n"
+        "• 🤖 Автогенерация контента\n"
+        "• 📊 A/B-тестирование\n"
+        "• 📈 Аналитика эффективности\n\n"
+        "Начните с бесплатного тарифа или выберите подходящий план!"
     )
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 # Обработка кнопок
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -191,84 +225,235 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = query.from_user.username or "Unknown"
     await query.answer()
 
-    tariffs = {
-        "order_packaging": {"basic": 15000, "premium": 35000},
-        "ai_assistants": {"basic": 25000, "premium": 50000},
-        "content_automation": {"startup": 30000, "agency": 100000},
-        "predictive_analytics": {"small_store": 50000, "large_store": 150000},
-        "chatbots": {"standard": 40000, "corporate": 120000}
+    # Новые тарифы согласно бизнес-плану
+    tariff_plans = {
+        "free": {"price": 0, "name": "Free"},
+        "basic": {"price": 990, "name": "Basic"},
+        "pro": {"price": 4990, "name": "Pro"},
+        "enterprise": {"price": "custom", "name": "Enterprise"}
     }
 
-    service_descriptions = {
-        "order_packaging": (
-            "📦 *Упаковка карточек*\n"
-            "Создаем SEO-оптимизированные карточки товаров для WB и Ozon.\n"
-            "- Базовый (15,000 ₽/мес): Заголовок, описание, изображения.\n"
-            "- Премиум (35,000 ₽/мес): Дополнительно A/B-тестирование и аналитика.\n"
-            "Выберите тариф:"
-        ),
-        "ai_assistants": (
-            "🤖 *ИИ-ассистенты*\n"
-            "Автоматизация рутинных задач: ответы клиентам, отчеты.\n"
-            "- Базовый (25,000 ₽/мес): Основные функции.\n"
-            "- Премиум (50,000 ₽/мес): Глубокая интеграция с CRM.\n"
-            "Выберите тариф:"
-        ),
-        "content_automation": (
-            "📝 *Автоматизация контент-маркетинга*\n"
-            "Генерация постов, статей, описаний.\n"
-            "- Стартап (30,000 ₽/мес): Базовый контент.\n"
-            "- Агентство (100,000 ₽/мес): Полная автоматизация и планирование.\n"
-            "Выберите тариф:"
-        ),
-        "predictive_analytics": (
-            "📊 *Предиктивная аналитика*\n"
-            "Прогноз спроса, динамическое ценообразование.\n"
-            "- Малый магазин (50,000 ₽/мес): Базовые прогнозы.\n"
-            "- Крупный магазин (150,000 ₽/мес): Персонализация и аналитика.\n"
-            "Выберите тариф:"
-        ),
-        "chatbots": (
-            "💬 *ИИ-чатботы для продаж*\n"
-            "Квалификация лидов, продажи 24/7.\n"
-            "- Стандарт (40,000 ₽/мес): Базовый чатбот.\n"
-            "- Корпоративный (120,000 ₽/мес): Омниканальность, CRM.\n"
-            "Выберите тариф:"
-        ),
-        "about": (
-            "ℹ️ *О UPAK*\n"
-            "Мы — нейросервис для автоматизации бизнеса на WB и Ozon. Генерируем карточки, контент, аналитику и чатботы с помощью ИИ.\n"
-            "Подробнее: https://upak.space\n"
-            "Свяжитесь с нами: support@upak.space"
+    if query.data == 'free_demo':
+        await add_lead_to_bitrix24(user_id, username, "free_demo_start")
+        await track_event(user_id, "free_demo_activated")
+        
+        # Активация демо-режима
+        if redis_client:
+            redis_client.setex(f"demo_{user_id}", 3600, json.dumps({
+                "status": "active", 
+                "plan": "free",
+                "timestamp": datetime.utcnow().isoformat()
+            }))
+        
+        demo_text = (
+            "🆓 *Бесплатный тариф активирован!*\n\n"
+            "✅ *Что доступно:*\n"
+            "• 1-2 проекта\n"
+            "• Базовые шаблоны карточек\n"
+            "• Ограниченное количество ИИ-генераций\n"
+            "• Создание карточек с водяными знаками\n\n"
+            "🚀 *Попробуйте прямо сейчас:*\n"
+            "Отправьте описание вашего товара, и я создам для вас демо-карточку!"
         )
-    }
-
-    if query.data in tariffs:
-        await add_lead_to_bitrix24(user_id, username, query.data)
-        await track_event(user_id, f"select_service_{query.data}")
+        
         keyboard = [
-            [InlineKeyboardButton("Базовый" if query.data != "content_automation" else "Стартап", callback_data=f"{query.data}_basic")],
-            [InlineKeyboardButton("Премиум" if query.data not in ["content_automation", "predictive_analytics", "chatbots"] else "Агентство" if query.data == "content_automation" else "Крупный магазин" if query.data == "predictive_analytics" else "Корпоративный", callback_data=f"{query.data}_premium")]
+            [InlineKeyboardButton("💎 Улучшить до Basic", callback_data='upgrade_basic')],
+            [InlineKeyboardButton("📋 Все тарифы", callback_data='choose_plan')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(service_descriptions[query.data], reply_markup=reply_markup, parse_mode='Markdown')
-    elif query.data == 'about':
-        await query.edit_message_text(service_descriptions['about'], parse_mode='Markdown')
-    elif query.data.endswith('_basic') or query.data.endswith('_premium'):
-        service, tariff = query.data.rsplit('_', 1)
-        amount = tariffs[service][tariff]
-        payment_url = await create_payment_link(user_id, service, tariff, amount)
-        await add_lead_to_bitrix24(user_id, username, f"{service}_{tariff}_payment")
-        await track_event(user_id, f"payment_initiated_{service}_{tariff}")
-        keyboard = [[InlineKeyboardButton("Оплатить", url=payment_url)]]
+        await query.edit_message_text(demo_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    elif query.data == 'choose_plan':
+        await add_lead_to_bitrix24(user_id, username, "view_pricing")
+        await track_event(user_id, "view_pricing_plans")
+        
+        pricing_text = (
+            "💎 *Тарифные планы UPAK*\n\n"
+            "🆓 *Free* — 0 ₽/мес\n"
+            "• 1-2 проекта\n"
+            "• Базовые шаблоны\n"
+            "• Ограниченные ИИ-генерации\n"
+            "• Водяные знаки на карточках\n\n"
+            "⭐ *Basic* — 990 ₽/мес\n"
+            "• Для ИП и фрилансеров\n"
+            "• Расширенные лимиты\n"
+            "• Без водяных знаков\n"
+            "• Полная библиотека шаблонов\n\n"
+            "🔥 *Pro* — 4,990 ₽/мес\n"
+            "• Для малого бизнеса и агентств\n"
+            "• Командная работа\n"
+            "• API для интеграций\n"
+            "• Расширенная аналитика\n\n"
+            "🏢 *Enterprise* — индивидуально\n"
+            "• Для крупных брендов\n"
+            "• Неограниченное использование\n"
+            "• Персональный менеджер\n"
+            "• Кастомные интеграции\n\n"
+            "Выберите подходящий тариф:"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🆓 Free", callback_data='select_free')],
+            [InlineKeyboardButton("⭐ Basic (990₽)", callback_data='select_basic')],
+            [InlineKeyboardButton("🔥 Pro (4,990₽)", callback_data='select_pro')],
+            [InlineKeyboardButton("🏢 Enterprise", callback_data='select_enterprise')]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(f"Вы выбрали тариф *{tariff.capitalize()}* для услуги *{service}*. Стоимость: {amount:,} ₽/мес.\nПерейдите для оплаты:", reply_markup=reply_markup, parse_mode='Markdown')
-    elif query.data == 'demo':
-        if redis_client:
-            redis_client.setex(f"demo_{user_id}", 3600, json.dumps({"status": "active", "timestamp": datetime.utcnow().isoformat()}))
+        await query.edit_message_text(pricing_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    elif query.data.startswith('select_'):
+        plan_type = query.data.replace('select_', '')
+        await add_lead_to_bitrix24(user_id, username, f"select_plan_{plan_type}")
+        await track_event(user_id, f"plan_selected_{plan_type}")
+        
+        if plan_type == 'free':
+            # Перенаправляем на активацию бесплатного тарифа
+            query.data = 'free_demo'
+            await button_handler(update, context)
+            return
+            
+        elif plan_type == 'enterprise':
+            contact_text = (
+                "🏢 *Enterprise план*\n\n"
+                "Для получения персонального предложения и обсуждения ваших потребностей:\n\n"
+                "📧 Email: enterprise@upak.space\n"
+                "💬 Telegram: @upak_support\n"
+                "📞 Телефон: +7 (999) 123-45-67\n\n"
+                "Наш менеджер свяжется с вами в течение 24 часов."
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("💬 Написать в поддержку", url="https://t.me/upak_support")],
+                [InlineKeyboardButton("📋 Все тарифы", callback_data='choose_plan')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(contact_text, reply_markup=reply_markup, parse_mode='Markdown')
+            
         else:
-            logger.warning("Redis недоступен, демо-режим не сохранен")
-        await query.edit_message_text("Запустите демо, отправив описание товара или выбрав услугу.")
+            # Basic или Pro план
+            plan_info = tariff_plans[plan_type]
+            amount = plan_info["price"]
+            plan_name = plan_info["name"]
+            
+            payment_url = await create_payment_link(user_id, "upak_platform", plan_type, amount)
+            
+            payment_text = (
+                f"💎 *Тариф {plan_name}*\n\n"
+                f"Стоимость: {amount:,} ₽/месяц\n\n"
+                f"После оплаты вы получите:\n"
+            )
+            
+            if plan_type == 'basic':
+                payment_text += (
+                    "• Неограниченные проекты\n"
+                    "• Без водяных знаков\n"
+                    "• Полная библиотека шаблонов\n"
+                    "• Приоритетная поддержка\n"
+                )
+            elif plan_type == 'pro':
+                payment_text += (
+                    "• Все возможности Basic\n"
+                    "• Командная работа\n"
+                    "• API для интеграций\n"
+                    "• Расширенная аналитика\n"
+                    "• A/B тестирование\n"
+                )
+            
+            keyboard = [
+                [InlineKeyboardButton("💳 Оплатить", url=payment_url)],
+                [InlineKeyboardButton("📋 Все тарифы", callback_data='choose_plan')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(payment_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    elif query.data.startswith('upgrade_'):
+        # Логика апгрейда с бесплатного тарифа
+        plan_type = query.data.replace('upgrade_', '')
+        query.data = f'select_{plan_type}'
+        await button_handler(update, context)
+        return
+
+    elif query.data == 'about':
+        about_text = (
+            "ℹ️ *О платформе UPAK*\n\n"
+            "🎯 *Наша миссия:* Создавай, Автоматизируй, Проверяй\n\n"
+            "UPAK — это комплексная платформа для создания продающих карточек товаров на Wildberries и Ozon с использованием искусственного интеллекта.\n\n"
+            "🔥 *Ключевые возможности:*\n"
+            "• Конструктор карточек с ИИ\n"
+            "• Автогенерация контента\n"
+            "• A/B-тестирование эффективности\n"
+            "• Аналитика и оптимизация\n"
+            "• Интеграция с маркетплейсами\n\n"
+            "🌐 Сайт: https://upak.space\n"
+            "✉️ Поддержка: support@upak.space\n"
+            "💬 Telegram: @upak_support"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🚀 Начать работу", callback_data='choose_plan')],
+            [InlineKeyboardButton("🆓 Попробовать бесплатно", callback_data='free_demo')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(about_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    elif query.data == 'how_it_works':
+        how_it_works_text = (
+            "💡 *Как работает UPAK*\n\n"
+            "1️⃣ *Создание*\n"
+            "Используйте конструктор или опишите товар — ИИ создаст карточку\n\n"
+            "2️⃣ *Автоматизация*\n"
+            "Генерация текстов, изображений и SEO-оптимизация через нейросети\n\n"
+            "3️⃣ *Проверка*\n"
+            "A/B-тестирование показывает, какая карточка продает лучше\n\n"
+            "4️⃣ *Результат*\n"
+            "Получите карточку, которая реально увеличивает продажи\n\n"
+            "🎯 *Результаты наших клиентов:*\n"
+            "• +30% к конверсии в среднем\n"
+            "• Экономия 70% времени на создание\n"
+            "• Рост продаж до +50%"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🆓 Попробовать сейчас", callback_data='free_demo')],
+            [InlineKeyboardButton("💎 Выбрать тариф", callback_data='choose_plan')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(how_it_works_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    elif query.data == 'create_another':
+        await track_event(user_id, "create_another_card")
+        create_text = (
+            "🎨 *Создание новой карточки*\n\n"
+            "Отправьте описание вашего товара, и я создам для вас новую карточку!\n\n"
+            "💡 *Совет:* Чем подробнее описание, тем лучше получится карточка."
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("📋 Мои тарифы", callback_data='choose_plan')],
+            [InlineKeyboardButton("ℹ️ Помощь", callback_data='about')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(create_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    elif query.data == 'view_analytics':
+        await track_event(user_id, "view_analytics_request")
+        analytics_text = (
+            "📊 *Аналитика и статистика*\n\n"
+            "🚀 *Скоро доступно!*\n"
+            "В ближайших обновлениях вы сможете:\n\n"
+            "• 📈 Просматривать статистику по карточкам\n"
+            "• 🎯 Анализировать эффективность A/B тестов\n"
+            "• 📋 Получать рекомендации по улучшению\n"
+            "• 💰 Отслеживать ROI от карточек\n\n"
+            "Уведомим вас о запуске!"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Создать новую карточку", callback_data='create_another')],
+            [InlineKeyboardButton("💎 Улучшить тариф", callback_data='choose_plan')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(analytics_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 # Обработка текстовых сообщений
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,31 +462,120 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     await track_event(user_id, "text_input")
 
+    # Проверяем статус пользователя (демо или активная подписка)
     demo_status = redis_client.get(f"demo_{user_id}") if redis_client else None
+    
     if demo_status and json.loads(demo_status).get("status") == "active":
-        await update.message.reply_text("🧠 Генерируем демо-карточку... Пожалуйста, подождите 10–15 секунд.")
+        user_plan = json.loads(demo_status).get("plan", "free")
+        
+        await update.message.reply_text(
+            "🧠 Генерируем карточку товара...\n"
+            f"📊 Тариф: {user_plan.capitalize()}\n"
+            "⏳ Пожалуйста, подождите 10-15 секунд."
+        )
+        
+        # Генерируем карточку
         card = await generate_card_data(user_text, user_id)
-        caption = f"*{card.title}*\n\n{card.description}\n\n" + "\n".join(card.features)
+        
+        # Формируем заголовок с учетом тарифа
+        if user_plan == "free":
+            caption = f"🆓 *ДЕМО-КАРТОЧКА* 🆓\n\n*{card.title}*\n\n{card.description}\n\n"
+            caption += "\n".join([f"• {feature}" for feature in card.features])
+            caption += "\n\n⚠️ *Это демо-версия с водяными знаками*"
+        else:
+            caption = f"*{card.title}*\n\n{card.description}\n\n"
+            caption += "\n".join([f"• {feature}" for feature in card.features])
+        
         await update.message.reply_photo(photo=card.image_url, caption=caption, parse_mode='Markdown')
-        keyboard = [[InlineKeyboardButton("Оформить подписку", callback_data='order_packaging')]]
-        await update.message.reply_text("Понравилась карточка? Выберите тариф для продолжения!", reply_markup=InlineKeyboardMarkup(keyboard))
+        
+        # Показываем кнопки в зависимости от тарифа
+        if user_plan == "free":
+            keyboard = [
+                [InlineKeyboardButton("💎 Улучшить до Basic (990₽)", callback_data='upgrade_basic')],
+                [InlineKeyboardButton("🔥 Улучшить до Pro (4,990₽)", callback_data='upgrade_pro')],
+                [InlineKeyboardButton("📋 Все тарифы", callback_data='choose_plan')]
+            ]
+            follow_up_text = (
+                "✨ *Понравилась карточка?*\n\n"
+                "🎯 С платными тарифами вы получите:\n"
+                "• Карточки без водяных знаков\n"
+                "• Больше ИИ-генераций\n"
+                "• Расширенные шаблоны\n"
+                "• A/B-тестирование\n\n"
+                "Выберите план для продолжения:"
+            )
+        else:
+            keyboard = [
+                [InlineKeyboardButton("🔄 Создать еще одну", callback_data='create_another')],
+                [InlineKeyboardButton("📊 Аналитика", callback_data='view_analytics')]
+            ]
+            follow_up_text = "✅ Карточка готова! Что дальше?"
+            
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(follow_up_text, reply_markup=reply_markup, parse_mode='Markdown')
+        
     else:
-        await update.message.reply_text("Отправьте описание товара для демо или выберите услугу через /start.")
+        # Пользователь не активировал демо или подписку
+        keyboard = [
+            [InlineKeyboardButton("🆓 Активировать бесплатный тариф", callback_data='free_demo')],
+            [InlineKeyboardButton("💎 Выбрать тариф", callback_data='choose_plan')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        welcome_back_text = (
+            "👋 Привет! Я вижу вы хотите создать карточку товара.\n\n"
+            "Для начала работы активируйте бесплатный тариф или выберите подходящий план.\n"
+            "🎁 В бесплатном тарифе доступно создание демо-карточек!"
+        )
+        
+        await update.message.reply_text(welcome_back_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Команда демо
+async def demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    username = update.effective_user.username or "Unknown"
+    await track_event(user_id, "demo_command")
+    await add_lead_to_bitrix24(user_id, username, "demo_command_used")
+
+    keyboard = [
+        [InlineKeyboardButton("🆓 Активировать бесплатный тариф", callback_data='free_demo')],
+        [InlineKeyboardButton("💎 Посмотреть все тарифы", callback_data='choose_plan')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    demo_text = (
+        "🎯 *Демо-режим UPAK*\n\n"
+        "Попробуйте создание карточек бесплатно!\n\n"
+        "В демо-режиме доступно:\n"
+        "• Создание карточек с ИИ\n"
+        "• Базовые шаблоны\n"
+        "• Ограниченные генерации\n\n"
+        "Активируйте бесплатный тариф для начала:"
+    )
+    
+    await update.message.reply_text(demo_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 # Обработка ошибок
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(msg="Ошибка:", exc_info=context.error)
-    if update and hasattr(update, 'effective_user'):
-        await track_event(str(update.effective_user.id), "error")
-        await update.message.reply_text("Произошла ошибка. Попробуйте снова или свяжитесь с нами: support@upak.space")
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
 
-# Запуск бота
-app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button_handler))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-app.add_handler(CommandHandler("demo", button_handler, filters=filters.Regex('^demo$')))
-app.add_error_handler(error_handler)
+# Главная функция
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    
+    # Добавление обработчиков команд
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("demo", demo))
+    
+    # Добавление обработчиков кнопок и сообщений
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Обработчик ошибок
+    app.add_error_handler(error_handler)
+    
+    logger.info("Бот UPAK запущен и готов к работе!")
+    app.run_polling()
 
 if __name__ == "__main__":
-    app.run_polling()
+    main()
