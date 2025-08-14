@@ -1,0 +1,29 @@
+
+[Unit]
+Description=UPAK Telegram Bot
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/upak-bot
+Environment=PATH=/home/ubuntu/upak-bot/venv/bin
+ExecStart=/home/ubuntu/upak-bot/venv/bin/python bot.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=upak-bot
+
+# Безопасность
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/upak-bot
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
