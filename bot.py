@@ -1,581 +1,341 @@
+import html
 import logging
 import os
-from datetime import datetime
-import requests
+from typing import Any
+
 import aiohttp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
-import json
-import redis
-import uuid
 
-# Настройка логов
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
-# Загрузка переменных окружения
 load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-YANDEX_GPT_API_KEY = os.getenv("YANDEX_GPT_API_KEY")
-BITRIX24_WEBHOOK = os.getenv("BITRIX24_WEBHOOK")
-YANDEX_CHECKOUT_KEY = os.getenv("YANDEX_CHECKOUT_KEY")
-YANDEX_CHECKOUT_SHOP_ID = os.getenv("YANDEX_CHECKOUT_SHOP_ID")
-YANDEX_METRIKA_ID = os.getenv("YANDEX_METRIKA_ID")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+API_BASE_URL = os.getenv("UPAK_API_BASE_URL", "https://api.upak.space").rstrip("/")
+SITE_URL = os.getenv("UPAK_SITE_URL", "https://www.upak.space").rstrip("/")
+SUPPORT_URL = os.getenv("UPAK_SUPPORT_URL", "https://t.me/SellEasyBot")
 
-# Проверка критически важных переменных
-if not all([TELEGRAM_TOKEN, YANDEX_GPT_API_KEY]):
-    raise ValueError("Не установлены критически важные переменные окружения: TELEGRAM_TOKEN, YANDEX_GPT_API_KEY")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is required")
 
-# Подключение к Redis (с fallback, если REDIS_URL не настроен)
-try:
-    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    redis_client.ping()
-except redis.RedisError as e:
-    logger.warning(f"Не удалось подключиться к Redis: {e}. Используется локальная память.")
-    redis_client = None
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO"),
+)
+logger = logging.getLogger("upak-bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 
-# Модель данных для карточки товара
-class ProductCard(BaseModel):
-    title: str = Field(max_length=100)
-    description: str = Field(max_length=1000)
-    features: list[str]
-    image_url: str
+PACKAGES: dict[str, dict[str, Any]] = {
+    "start": {
+        "name": "Start",
+        "price": "349 руб.",
+        "cards": "1 карточка",
+        "description": "SEO-описание, преимущества, характеристики и ТЗ для визуала.",
+    },
+    "pro": {
+        "name": "Pro 10",
+        "price": "2 490 руб.",
+        "cards": "10 карточек",
+        "description": "Основной пакет для селлеров, которым нужно быстро обновить линейку SKU.",
+    },
+    "business30": {
+        "name": "Business 30",
+        "price": "5 990 руб.",
+        "cards": "30 карточек",
+        "description": "Пакет для менеджеров маркетплейсов, фотостудий и регулярного потока товаров.",
+    },
+    "expert1": {
+        "name": "Проверка специалистом",
+        "price": "790 руб.",
+        "cards": "1 карточка",
+        "description": "Ручная проверка SEO, преимуществ, структуры и рекомендаций по визуалу.",
+    },
+    "expert10": {
+        "name": "Проверка 10 карточек",
+        "price": "4 990 руб.",
+        "cards": "10 карточек",
+        "description": "Ручная проверка пакета карточек перед публикацией или обновлением.",
+    },
+}
 
-# Генерация карточки товара через Yandex GPT
-async def generate_card_data(product_text: str, user_id: str) -> ProductCard:
-    async with aiohttp.ClientSession() as session:
-        headers = {"Authorization": f"Bearer {YANDEX_GPT_API_KEY}"}
-        payload = {
-            "model": "yandexgpt",
-            "messages": [
-                {"role": "system", "content": "Ты эксперт по созданию карточек товаров для Wildberries и Ozon. Сгенерируй заголовок (до 100 символов), описание (до 1000 символов), список преимуществ (3-5 пунктов) и URL изображения (используй Canva API)."},
-                {"role": "user", "content": f"Создай карточку для: {product_text}"}
-            ]
-        }
-        try:
-            async with session.post("https://api.yandex.cloud/gpt/v1/completions", json=payload, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    card_data = json.loads(data["choices"][0]["message"]["content"])
-                    return ProductCard(**card_data)
-                else:
-                    logger.error(f"Ошибка Yandex GPT API: {response.status}")
-                    return ProductCard(
-                        title="Ошибка генерации",
-                        description="Не удалось сгенерировать карточку. Попробуйте позже.",
-                        features=["Попробуйте снова"],
-                        image_url="https://via.placeholder.com/512x512.png?text=Error"
-                    )
-        except Exception as e:
-            logger.error(f"Ошибка при вызове Yandex GPT: {e}")
-            return ProductCard(
-                title="Ошибка генерации",
-                description="Не удалось сгенерировать карточку. Попробуйте позже.",
-                features=["Попробуйте снова"],
-                image_url="https://via.placeholder.com/512x512.png?text=Error"
-            )
+MARKETPLACES = ("Wildberries", "Ozon", "WB + Ozon", "Другая площадка")
 
-# Интеграция с Bitrix24 для добавления лида
-async def add_lead_to_bitrix24(user_id: str, username: str, service: str):
-    if not BITRIX24_WEBHOOK:
-        logger.warning("Bitrix24 webhook не настроен, пропускаем добавление лида")
-        return
-    payload = {
-        "fields": {
-            "TITLE": f"Лид от Telegram: {username}",
-            "SOURCE_ID": "TELEGRAM",
-            "ASSIGNED_BY_ID": 1,
-            "COMMENTS": f"Заинтересован в услуге: {service}",
-            "UF_CRM_1634567890": user_id
-        }
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{BITRIX24_WEBHOOK}/crm.lead.add.json", json=payload) as response:
-                if response.status == 200:
-                    logger.info(f"Лид добавлен для {username}, услуга: {service}")
-                else:
-                    logger.error(f"Ошибка Bitrix24: {response.status}")
-    except Exception as e:
-        logger.error(f"Ошибка интеграции с Bitrix24: {e}")
 
-# Создание платежной ссылки через YooKassa (ЮKassa)
-async def create_payment_link(user_id: str, service: str, tariff: str, amount: float) -> str:
-    if not (YANDEX_CHECKOUT_KEY and YANDEX_CHECKOUT_SHOP_ID):
-        logger.warning("YooKassa не настроена, возвращаем заглушку")
-        return "https://upak.space/payment-not-configured"
-    
-    import base64
-    payment_id = str(uuid.uuid4())
-    
-    # Правильная авторизация для YooKassa API - Basic Auth
-    auth_string = base64.b64encode(f"{YANDEX_CHECKOUT_SHOP_ID}:{YANDEX_CHECKOUT_KEY}".encode()).decode()
-    
-    payload = {
-        "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-        "confirmation": {"type": "redirect", "return_url": "https://upak.space/payment-success"},
-        "capture": True,
-        "description": f"Оплата тарифа {tariff} для {service} (ID: {user_id})",
-        "metadata": {"user_id": user_id, "service": service, "tariff": tariff},
-        "receipt": {
-            "customer": {
-                "email": f"user_{user_id}@upak.space"
-            },
-            "items": [
-                {
-                    "description": f"Тариф {tariff.upper()} платформы UPAK",
-                    "quantity": "1.00",
-                    "amount": {
-                        "value": f"{amount:.2f}",
-                        "currency": "RUB"
-                    },
-                    "vat_code": "1",
-                    "payment_mode": "full_payment",
-                    "payment_subject": "service"
-                }
-            ]
-        }
-    }
-    
-    headers = {
-        "Idempotence-Key": payment_id,
-        "Authorization": f"Basic {auth_string}",
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.yookassa.ru/v3/payments",
-                json=payload,
-                headers=headers
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logger.info(f"Платеж создан успешно: {data.get('id')}")
-                    return data["confirmation"]["confirmation_url"]
-                else:
-                    response_text = await response.text()
-                    logger.error(f"Ошибка YooKassa: {response.status}, Response: {response_text}")
-                    return "https://upak.space/payment-error"
-    except Exception as e:
-        logger.error(f"Исключение при создании платежа: {e}")
-        return "https://upak.space/payment-error"
+def esc(value: Any) -> str:
+    return html.escape(str(value or ""), quote=False)
 
-# Отправка события в Yandex Metrika
-async def track_event(user_id: str, event: str):
-    if not YANDEX_METRIKA_ID:
-        logger.warning("Yandex Metrika не настроена, пропускаем трекинг")
-        return
-    async with aiohttp.ClientSession() as session:
-        try:
-            await session.get(
-                f"https://mc.yandex.ru/metrika/tag.js?counter={YANDEX_METRIKA_ID}&event={event}&user_id={user_id}"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка Yandex Metrika: {e}")
 
-# Стартовое сообщение
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    username = update.effective_user.username or "Unknown"
-    await track_event(user_id, "start_command")
-    await add_lead_to_bitrix24(user_id, username, "Начало взаимодействия")
-
-    keyboard = [
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("🆓 Попробовать бесплатно", callback_data='free_demo'),
-            InlineKeyboardButton("💎 Выбрать тариф", callback_data='choose_plan')
-        ],
-        [
-            InlineKeyboardButton("ℹ️ О UPAK", callback_data='about'),
-            InlineKeyboardButton("💡 Как это работает", callback_data='how_it_works')
+            [InlineKeyboardButton("Получить бесплатный preview", callback_data="preview")],
+            [InlineKeyboardButton("Тарифы и оплата", callback_data="pricing")],
+            [InlineKeyboardButton("Как это работает", callback_data="how"), InlineKeyboardButton("Сайт", url=SITE_URL)],
         ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    welcome_text = (
-        "Добро пожаловать в UPAK! 🚀\n\n"
-        "🎯 *Создавай, Автоматизируй, Проверяй*\n\n"
-        "Платформа для создания продающих карточек на Wildberries и Ozon:\n"
-        "• 🎨 Конструктор карточек с ИИ\n"
-        "• 🤖 Автогенерация контента\n"
-        "• 📊 A/B-тестирование\n"
-        "• 📈 Аналитика эффективности\n\n"
-        "Начните с бесплатного тарифа или выберите подходящий план!"
     )
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
 
-# Обработка кнопок
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+def pricing_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Start - 349 руб.", callback_data="buy:start")],
+            [InlineKeyboardButton("Pro 10 - 2 490 руб.", callback_data="buy:pro")],
+            [InlineKeyboardButton("Business 30 - 5 990 руб.", callback_data="buy:business30")],
+            [InlineKeyboardButton("Проверка - 790 руб.", callback_data="buy:expert1")],
+            [InlineKeyboardButton("Проверка 10 - 4 990 руб.", callback_data="buy:expert10")],
+            [InlineKeyboardButton("Бесплатный preview", callback_data="preview")],
+        ]
+    )
+
+
+async def api_post(path: str, payload: dict[str, Any], params: dict[str, str] | None = None) -> dict[str, Any]:
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(f"{API_BASE_URL}{path}", json=payload, params=params) as response:
+            data = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(f"API error {response.status}: {data}")
+            return data
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    text = (
+        "<b>UPAK для карточек WB/Ozon</b>\n\n"
+        "Помогаю быстро получить черновик карточки товара: название, SEO-фрагмент, преимущества "
+        "и структуру для дальнейшей работы.\n\n"
+        "<b>Воронка:</b>\n"
+        "1. Бесплатный preview.\n"
+        "2. Start за 349 руб.\n"
+        "3. Pro 10, Business 30 или ручная проверка.\n\n"
+        "Без обещаний топа и гарантированного роста продаж: даем понятную структуру и экономим время."
+    )
+    if update.message:
+        await update.message.reply_html(text, reply_markup=main_keyboard())
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=main_keyboard(), parse_mode="HTML")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "<b>Команды UPAK</b>\n\n"
+        "/start - главное меню\n"
+        "/preview - бесплатный preview\n"
+        "/pricing - тарифы и оплата\n\n"
+        "Для preview достаточно описать товар: что это, для какой площадки, основные характеристики."
+    )
+    await update.message.reply_html(text, reply_markup=main_keyboard())
+
+
+async def preview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await begin_preview(update, context)
+
+
+async def pricing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show_pricing(update, context)
+
+
+async def begin_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    context.user_data["flow"] = "preview_product"
+    text = (
+        "<b>Бесплатный preview</b>\n\n"
+        "Пришлите описание товара одним сообщением. Например:\n"
+        "<i>Женская демисезонная куртка, экокожа, размеры 42-50, для Wildberries.</i>\n\n"
+        "Я верну короткий пример: название, 3 преимущества и фрагмент описания."
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML")
+    else:
+        await update.message.reply_html(text)
+
+
+async def show_pricing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = ["<b>Тарифы UPAK</b>", ""]
+    for key in ("start", "pro", "business30", "expert1", "expert10"):
+        item = PACKAGES[key]
+        lines.append(f"<b>{esc(item['name'])}</b> - {esc(item['price'])}, {esc(item['cards'])}")
+        lines.append(esc(item["description"]))
+        lines.append("")
+    lines.append("Для оплаты выберите тариф. Нужен email для чека YooKassa.")
+    text = "\n".join(lines)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=pricing_keyboard(), parse_mode="HTML")
+    else:
+        await update.message.reply_html(text, reply_markup=pricing_keyboard())
+
+
+async def show_how(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "<b>Как работает UPAK</b>\n\n"
+        "1. Вы отправляете товар и площадку.\n"
+        "2. Получаете бесплатный preview.\n"
+        "3. Если структура подходит, оплачиваете Start или пакет.\n"
+        "4. Для сложных товаров можно заказать ручную проверку специалистом.\n\n"
+        "Важно: результат помогает подготовить карточку, но продажи зависят также от цены, фото, отзывов, рекламы и конкуренции."
+    )
+    await update.callback_query.edit_message_text(text, reply_markup=main_keyboard(), parse_mode="HTML")
+
+
+async def begin_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, package: str) -> None:
+    item = PACKAGES[package]
+    context.user_data.clear()
+    context.user_data["flow"] = "payment_email"
+    context.user_data["package"] = package
+    text = (
+        f"<b>{esc(item['name'])}</b>\n"
+        f"Цена: <b>{esc(item['price'])}</b>\n"
+        f"Объем: {esc(item['cards'])}\n\n"
+        f"{esc(item['description'])}\n\n"
+        "Пришлите email для онлайн-чека и ссылки на оплату."
+    )
+    await update.callback_query.edit_message_text(text, parse_mode="HTML")
+
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    user_id = str(query.from_user.id)
-    username = query.from_user.username or "Unknown"
     await query.answer()
 
-    # Новые тарифы согласно бизнес-плану
-    tariff_plans = {
-        "free": {"price": 0, "name": "Free"},
-        "basic": {"price": 990, "name": "Basic"},
-        "pro": {"price": 4990, "name": "Pro"},
-        "enterprise": {"price": "custom", "name": "Enterprise"}
+    data = query.data or ""
+    if data == "preview":
+        await begin_preview(update, context)
+    elif data == "pricing":
+        await show_pricing(update, context)
+    elif data == "how":
+        await show_how(update, context)
+    elif data.startswith("buy:"):
+        package = data.split(":", 1)[1]
+        if package not in PACKAGES:
+            await query.edit_message_text("Тариф не найден. Откройте список тарифов заново.", reply_markup=main_keyboard())
+            return
+        await begin_payment(update, context, package)
+    elif data == "menu":
+        await start(update, context)
+
+
+async def create_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, product: str) -> None:
+    user = update.effective_user
+    telegram_contact = f"@{user.username}" if user and user.username else str(user.id if user else "")
+    payload = {
+        "product": product,
+        "marketplace": "WB/Ozon",
+        "telegram": telegram_contact,
     }
 
-    if query.data == 'free_demo':
-        await add_lead_to_bitrix24(user_id, username, "free_demo_start")
-        await track_event(user_id, "free_demo_activated")
-        
-        # Активация демо-режима
-        if redis_client:
-            redis_client.setex(f"demo_{user_id}", 3600, json.dumps({
-                "status": "active", 
-                "plan": "free",
-                "timestamp": datetime.utcnow().isoformat()
-            }))
-        
-        demo_text = (
-            "🆓 *Бесплатный тариф активирован!*\n\n"
-            "✅ *Что доступно:*\n"
-            "• 1-2 проекта\n"
-            "• Базовые шаблоны карточек\n"
-            "• Ограниченное количество ИИ-генераций\n"
-            "• Создание карточек с водяными знаками\n\n"
-            "🚀 *Попробуйте прямо сейчас:*\n"
-            "Отправьте описание вашего товара, и я создам для вас демо-карточку!"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("💎 Улучшить до Basic", callback_data='upgrade_basic')],
-            [InlineKeyboardButton("📋 Все тарифы", callback_data='choose_plan')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(demo_text, reply_markup=reply_markup, parse_mode='Markdown')
+    await update.message.reply_text("Готовлю preview...")
+    data = await api_post("/v2/preview", payload)
 
-    elif query.data == 'choose_plan':
-        await add_lead_to_bitrix24(user_id, username, "view_pricing")
-        await track_event(user_id, "view_pricing_plans")
-        
-        pricing_text = (
-            "💎 *Тарифные планы UPAK*\n\n"
-            "🆓 *Free* — 0 ₽/мес\n"
-            "• 1-2 проекта\n"
-            "• Базовые шаблоны\n"
-            "• Ограниченные ИИ-генерации\n"
-            "• Водяные знаки на карточках\n\n"
-            "⭐ *Basic* — 990 ₽/мес\n"
-            "• Для ИП и фрилансеров\n"
-            "• Расширенные лимиты\n"
-            "• Без водяных знаков\n"
-            "• Полная библиотека шаблонов\n\n"
-            "🔥 *Pro* — 4,990 ₽/мес\n"
-            "• Для малого бизнеса и агентств\n"
-            "• Командная работа\n"
-            "• API для интеграций\n"
-            "• Расширенная аналитика\n\n"
-            "🏢 *Enterprise* — индивидуально\n"
-            "• Для крупных брендов\n"
-            "• Неограниченное использование\n"
-            "• Персональный менеджер\n"
-            "• Кастомные интеграции\n\n"
-            "Выберите подходящий тариф:"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🆓 Free", callback_data='select_free')],
-            [InlineKeyboardButton("⭐ Basic (990₽)", callback_data='select_basic')],
-            [InlineKeyboardButton("🔥 Pro (4,990₽)", callback_data='select_pro')],
-            [InlineKeyboardButton("🏢 Enterprise", callback_data='select_enterprise')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(pricing_text, reply_markup=reply_markup, parse_mode='Markdown')
+    advantages = data.get("advantages") or []
+    advantages_text = "\n".join(f"- {esc(item)}" for item in advantages)
+    text = (
+        "<b>Ваш бесплатный preview</b>\n\n"
+        f"<b>{esc(data.get('title'))}</b>\n\n"
+        f"{advantages_text}\n\n"
+        f"{esc(data.get('description_fragment'))}\n\n"
+        f"<b>Следующий шаг:</b> {esc(data.get('next_step'))}"
+    )
+    await update.message.reply_html(text, reply_markup=pricing_keyboard())
+    context.user_data.clear()
 
-    elif query.data.startswith('select_'):
-        plan_type = query.data.replace('select_', '')
-        await add_lead_to_bitrix24(user_id, username, f"select_plan_{plan_type}")
-        await track_event(user_id, f"plan_selected_{plan_type}")
-        
-        if plan_type == 'free':
-            # Перенаправляем на активацию бесплатного тарифа
-            query.data = 'free_demo'
-            await button_handler(update, context)
-            return
-            
-        elif plan_type == 'enterprise':
-            contact_text = (
-                "🏢 *Enterprise план*\n\n"
-                "Для получения персонального предложения и обсуждения ваших потребностей:\n\n"
-                "📧 Email: enterprise@upak.space\n"
-                "💬 Telegram: @upak_support\n"
-                "📞 Телефон: +7 (999) 123-45-67\n\n"
-                "Наш менеджер свяжется с вами в течение 24 часов."
-            )
-            
-            keyboard = [
-                [InlineKeyboardButton("💬 Написать в поддержку", url="https://t.me/upak_support")],
-                [InlineKeyboardButton("📋 Все тарифы", callback_data='choose_plan')]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(contact_text, reply_markup=reply_markup, parse_mode='Markdown')
-            
-        else:
-            # Basic или Pro план
-            plan_info = tariff_plans[plan_type]
-            amount = plan_info["price"]
-            plan_name = plan_info["name"]
-            
-            payment_url = await create_payment_link(user_id, "upak_platform", plan_type, amount)
-            
-            payment_text = (
-                f"💎 *Тариф {plan_name}*\n\n"
-                f"Стоимость: {amount:,} ₽/месяц\n\n"
-                f"После оплаты вы получите:\n"
-            )
-            
-            if plan_type == 'basic':
-                payment_text += (
-                    "• Неограниченные проекты\n"
-                    "• Без водяных знаков\n"
-                    "• Полная библиотека шаблонов\n"
-                    "• Приоритетная поддержка\n"
-                )
-            elif plan_type == 'pro':
-                payment_text += (
-                    "• Все возможности Basic\n"
-                    "• Командная работа\n"
-                    "• API для интеграций\n"
-                    "• Расширенная аналитика\n"
-                    "• A/B тестирование\n"
-                )
-            
-            keyboard = [
-                [InlineKeyboardButton("💳 Оплатить", url=payment_url)],
-                [InlineKeyboardButton("📋 Все тарифы", callback_data='choose_plan')]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(payment_text, reply_markup=reply_markup, parse_mode='Markdown')
 
-    elif query.data.startswith('upgrade_'):
-        # Логика апгрейда с бесплатного тарифа
-        plan_type = query.data.replace('upgrade_', '')
-        query.data = f'select_{plan_type}'
-        await button_handler(update, context)
+async def create_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, email: str) -> None:
+    package = context.user_data.get("package")
+    if package not in PACKAGES:
+        context.user_data.clear()
+        await update.message.reply_text("Не вижу выбранный тариф. Откройте тарифы заново.", reply_markup=pricing_keyboard())
         return
 
-    elif query.data == 'about':
-        about_text = (
-            "ℹ️ *О платформе UPAK*\n\n"
-            "🎯 *Наша миссия:* Создавай, Автоматизируй, Проверяй\n\n"
-            "UPAK — это комплексная платформа для создания продающих карточек товаров на Wildberries и Ozon с использованием искусственного интеллекта.\n\n"
-            "🔥 *Ключевые возможности:*\n"
-            "• Конструктор карточек с ИИ\n"
-            "• Автогенерация контента\n"
-            "• A/B-тестирование эффективности\n"
-            "• Аналитика и оптимизация\n"
-            "• Интеграция с маркетплейсами\n\n"
-            "🌐 Сайт: https://upak.space\n"
-            "✉️ Поддержка: support@upak.space\n"
-            "💬 Telegram: @upak_support"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🚀 Начать работу", callback_data='choose_plan')],
-            [InlineKeyboardButton("🆓 Попробовать бесплатно", callback_data='free_demo')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(about_text, reply_markup=reply_markup, parse_mode='Markdown')
+    user = update.effective_user
+    telegram_contact = f"@{user.username}" if user and user.username else str(user.id if user else "")
+    payload = {"email": email, "telegram": telegram_contact}
 
-    elif query.data == 'how_it_works':
-        how_it_works_text = (
-            "💡 *Как работает UPAK*\n\n"
-            "1️⃣ *Создание*\n"
-            "Используйте конструктор или опишите товар — ИИ создаст карточку\n\n"
-            "2️⃣ *Автоматизация*\n"
-            "Генерация текстов, изображений и SEO-оптимизация через нейросети\n\n"
-            "3️⃣ *Проверка*\n"
-            "A/B-тестирование показывает, какая карточка продает лучше\n\n"
-            "4️⃣ *Результат*\n"
-            "Получите карточку, которая реально увеличивает продажи\n\n"
-            "🎯 *Результаты наших клиентов:*\n"
-            "• +30% к конверсии в среднем\n"
-            "• Экономия 70% времени на создание\n"
-            "• Рост продаж до +50%"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🆓 Попробовать сейчас", callback_data='free_demo')],
-            [InlineKeyboardButton("💎 Выбрать тариф", callback_data='choose_plan')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(how_it_works_text, reply_markup=reply_markup, parse_mode='Markdown')
+    await update.message.reply_text("Создаю ссылку на оплату YooKassa...")
+    data = await api_post("/v2/payments/create-payment", payload, params={"subscription_type": package})
+    payment_url = data.get("payment_url") or data.get("confirmation_url")
+    item = PACKAGES[package]
 
-    elif query.data == 'create_another':
-        await track_event(user_id, "create_another_card")
-        create_text = (
-            "🎨 *Создание новой карточки*\n\n"
-            "Отправьте описание вашего товара, и я создам для вас новую карточку!\n\n"
-            "💡 *Совет:* Чем подробнее описание, тем лучше получится карточка."
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("📋 Мои тарифы", callback_data='choose_plan')],
-            [InlineKeyboardButton("ℹ️ Помощь", callback_data='about')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(create_text, reply_markup=reply_markup, parse_mode='Markdown')
+    if not payment_url:
+        raise RuntimeError("Payment URL is empty")
 
-    elif query.data == 'view_analytics':
-        await track_event(user_id, "view_analytics_request")
-        analytics_text = (
-            "📊 *Аналитика и статистика*\n\n"
-            "🚀 *Скоро доступно!*\n"
-            "В ближайших обновлениях вы сможете:\n\n"
-            "• 📈 Просматривать статистику по карточкам\n"
-            "• 🎯 Анализировать эффективность A/B тестов\n"
-            "• 📋 Получать рекомендации по улучшению\n"
-            "• 💰 Отслеживать ROI от карточек\n\n"
-            "Уведомим вас о запуске!"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🔄 Создать новую карточку", callback_data='create_another')],
-            [InlineKeyboardButton("💎 Улучшить тариф", callback_data='choose_plan')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(analytics_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-# Обработка текстовых сообщений
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    username = update.effective_user.username or "Unknown"
-    user_text = update.message.text
-    await track_event(user_id, "text_input")
-
-    # Проверяем статус пользователя (демо или активная подписка)
-    demo_status = redis_client.get(f"demo_{user_id}") if redis_client else None
-    
-    if demo_status and json.loads(demo_status).get("status") == "active":
-        user_plan = json.loads(demo_status).get("plan", "free")
-        
-        await update.message.reply_text(
-            "🧠 Генерируем карточку товара...\n"
-            f"📊 Тариф: {user_plan.capitalize()}\n"
-            "⏳ Пожалуйста, подождите 10-15 секунд."
-        )
-        
-        # Генерируем карточку
-        card = await generate_card_data(user_text, user_id)
-        
-        # Формируем заголовок с учетом тарифа
-        if user_plan == "free":
-            caption = f"🆓 *ДЕМО-КАРТОЧКА* 🆓\n\n*{card.title}*\n\n{card.description}\n\n"
-            caption += "\n".join([f"• {feature}" for feature in card.features])
-            caption += "\n\n⚠️ *Это демо-версия с водяными знаками*"
-        else:
-            caption = f"*{card.title}*\n\n{card.description}\n\n"
-            caption += "\n".join([f"• {feature}" for feature in card.features])
-        
-        await update.message.reply_photo(photo=card.image_url, caption=caption, parse_mode='Markdown')
-        
-        # Показываем кнопки в зависимости от тарифа
-        if user_plan == "free":
-            keyboard = [
-                [InlineKeyboardButton("💎 Улучшить до Basic (990₽)", callback_data='upgrade_basic')],
-                [InlineKeyboardButton("🔥 Улучшить до Pro (4,990₽)", callback_data='upgrade_pro')],
-                [InlineKeyboardButton("📋 Все тарифы", callback_data='choose_plan')]
-            ]
-            follow_up_text = (
-                "✨ *Понравилась карточка?*\n\n"
-                "🎯 С платными тарифами вы получите:\n"
-                "• Карточки без водяных знаков\n"
-                "• Больше ИИ-генераций\n"
-                "• Расширенные шаблоны\n"
-                "• A/B-тестирование\n\n"
-                "Выберите план для продолжения:"
-            )
-        else:
-            keyboard = [
-                [InlineKeyboardButton("🔄 Создать еще одну", callback_data='create_another')],
-                [InlineKeyboardButton("📊 Аналитика", callback_data='view_analytics')]
-            ]
-            follow_up_text = "✅ Карточка готова! Что дальше?"
-            
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(follow_up_text, reply_markup=reply_markup, parse_mode='Markdown')
-        
-    else:
-        # Пользователь не активировал демо или подписку
-        keyboard = [
-            [InlineKeyboardButton("🆓 Активировать бесплатный тариф", callback_data='free_demo')],
-            [InlineKeyboardButton("💎 Выбрать тариф", callback_data='choose_plan')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        welcome_back_text = (
-            "👋 Привет! Я вижу вы хотите создать карточку товара.\n\n"
-            "Для начала работы активируйте бесплатный тариф или выберите подходящий план.\n"
-            "🎁 В бесплатном тарифе доступно создание демо-карточек!"
-        )
-        
-        await update.message.reply_text(welcome_back_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-# Команда демо
-async def demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    username = update.effective_user.username or "Unknown"
-    await track_event(user_id, "demo_command")
-    await add_lead_to_bitrix24(user_id, username, "demo_command_used")
-
-    keyboard = [
-        [InlineKeyboardButton("🆓 Активировать бесплатный тариф", callback_data='free_demo')],
-        [InlineKeyboardButton("💎 Посмотреть все тарифы", callback_data='choose_plan')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    demo_text = (
-        "🎯 *Демо-режим UPAK*\n\n"
-        "Попробуйте создание карточек бесплатно!\n\n"
-        "В демо-режиме доступно:\n"
-        "• Создание карточек с ИИ\n"
-        "• Базовые шаблоны\n"
-        "• Ограниченные генерации\n\n"
-        "Активируйте бесплатный тариф для начала:"
+    text = (
+        f"<b>Оплата {esc(item['name'])}</b>\n\n"
+        f"Сумма: <b>{esc(item['price'])}</b>\n"
+        f"Order ID: <code>{esc(data.get('order_id'))}</code>\n\n"
+        "После оплаты вернитесь на сайт или напишите сюда: поможем довести карточку до результата."
     )
-    
-    await update.message.reply_text(demo_text, reply_markup=reply_markup, parse_mode='Markdown')
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Оплатить YooKassa", url=payment_url)],
+            [InlineKeyboardButton("Получить еще preview", callback_data="preview")],
+        ]
+    )
+    await update.message.reply_html(text, reply_markup=keyboard)
+    context.user_data.clear()
 
-# Обработка ошибок
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Exception while handling an update:", exc_info=context.error)
 
-# Главная функция
-def main():
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    flow = context.user_data.get("flow")
+
+    try:
+        if flow == "preview_product":
+            if len(text) < 8:
+                await update.message.reply_text("Опишите товар чуть подробнее: тип, характеристики и площадку.")
+                return
+            await create_preview(update, context, text)
+            return
+
+        if flow == "payment_email":
+            if "@" not in text or "." not in text:
+                await update.message.reply_text("Пришлите корректный email для онлайн-чека.")
+                return
+            await create_payment(update, context, text)
+            return
+
+        await update.message.reply_html(
+            "Могу сделать бесплатный preview или показать тарифы. Выберите действие:",
+            reply_markup=main_keyboard(),
+        )
+    except Exception as exc:
+        logger.exception("Failed to process message")
+        context.user_data.clear()
+        await update.message.reply_html(
+            "Сейчас не получилось выполнить действие автоматически. Попробуйте еще раз или откройте сайт.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Открыть сайт", url=SITE_URL)],
+                    [InlineKeyboardButton("Главное меню", callback_data="menu")],
+                ]
+            ),
+        )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled bot error: %s", context.error)
+
+
+def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    
-    # Добавление обработчиков команд
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("demo", demo))
-    
-    # Добавление обработчиков кнопок и сообщений
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("preview", preview_command))
+    app.add_handler(CommandHandler("pricing", pricing_command))
+    app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
-    # Обработчик ошибок
     app.add_error_handler(error_handler)
-    
-    logger.info("Бот UPAK запущен и готов к работе!")
-    app.run_polling()
+    logger.info("UPAK Telegram bot started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
